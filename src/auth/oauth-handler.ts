@@ -9,7 +9,7 @@ import {
   refreshAuthToken
 } from './cloudflare-auth'
 import { ALL_SCOPES, SCOPE_TEMPLATES, DEFAULT_TEMPLATE, MAX_SCOPES } from './scopes'
-import { UserSchema, AccountsSchema, type AuthProps } from './types'
+import { UserSchema, AccountsSchema, type AuthProps, type AccountSchema } from './types'
 import {
   clientIdAlreadyApproved,
   createOAuthState,
@@ -35,61 +35,98 @@ interface AuthEnv extends Env {
 
 const env = cloudflareEnv as AuthEnv
 
-/** Cloudflare API response shape */
-interface CloudflareApiResponse<T> {
-  success: boolean
-  result?: T
-  errors?: Array<{ code: number; message: string }>
+function throwCombinedCloudflareApiError(userStatus: number, accountsStatus: number): never {
+  const statuses = [userStatus, accountsStatus]
+
+  if (statuses.some((status) => status >= 500)) {
+    throw new OAuthError('server_error', 'Cloudflare API is temporarily unavailable', 502)
+  }
+
+  if (statuses.includes(429)) {
+    throw new OAuthError('temporarily_unavailable', 'Rate limited, try again later', 429)
+  }
+
+  if (statuses.includes(401)) {
+    throw new OAuthError('invalid_token', 'Access token is invalid or expired', 401)
+  }
+
+  if (statuses.includes(403)) {
+    throw new OAuthError('insufficient_scope', 'Insufficient permissions', 403)
+  }
+
+  throw new OAuthError('invalid_token', 'Failed to verify token', userStatus)
+}
+
+async function fetchCloudflareProbes(accessToken: string): Promise<[Response, Response]> {
+  const headers = { Authorization: `Bearer ${accessToken}` }
+
+  try {
+    return await Promise.all([
+      fetch(`${env.CLOUDFLARE_API_BASE}/user`, { headers }),
+      fetch(`${env.CLOUDFLARE_API_BASE}/accounts`, { headers })
+    ])
+  } catch (error) {
+    console.error('Cloudflare API request failed', error)
+    throw new OAuthError('server_error', 'Cloudflare API is temporarily unavailable', 502)
+  }
 }
 
 /**
  * Fetch user and accounts from Cloudflare API
  */
 export async function getUserAndAccounts(accessToken: string): Promise<{
-  user: { id: string; email: string } | null
-  accounts: Array<{ id: string; name: string }>
+  user: UserSchema | null
+  accounts: AccountSchema[]
 }> {
-  const headers = { Authorization: `Bearer ${accessToken}` }
-
-  const [userResp, accountsResp] = await Promise.all([
-    fetch(`${env.CLOUDFLARE_API_BASE}/user`, { headers }),
-    fetch(`${env.CLOUDFLARE_API_BASE}/accounts`, { headers })
-  ])
+  const [userResp, accountsResp] = await fetchCloudflareProbes(accessToken)
 
   // Check for upstream errors before parsing
   if (!userResp.ok && !accountsResp.ok) {
-    const status = userResp.status
     console.error(`Cloudflare API error: user=${userResp.status}, accounts=${accountsResp.status}`)
-    if (status >= 500) {
-      throw new OAuthError('server_error', 'Cloudflare API is temporarily unavailable', 502)
-    }
-    if (status === 401) {
-      throw new OAuthError('invalid_token', 'Access token is invalid or expired', 401)
-    }
-    if (status === 403) {
-      throw new OAuthError('insufficient_scope', 'Insufficient permissions', 403)
-    }
-    if (status === 429) {
-      throw new OAuthError('temporarily_unavailable', 'Rate limited, try again later', 429)
-    }
-    throw new OAuthError('invalid_token', 'Failed to verify token', status)
+    throwCombinedCloudflareApiError(userResp.status, accountsResp.status)
   }
 
-  const userData = (await userResp.json()) as CloudflareApiResponse<{ id: string; email: string }>
-  const accountsData = (await accountsResp.json()) as CloudflareApiResponse<
-    Array<{ id: string; name: string }>
-  >
-
-  // Parse accounts (always try)
-  const accounts =
-    accountsData.success && accountsData.result ? AccountsSchema.parse(accountsData.result) : []
-
-  // User token - parse user
-  if (userData.success && userData.result) {
-    return {
-      user: UserSchema.parse(userData.result),
-      accounts
+  // Parse user from response
+  let user: UserSchema | null = null
+  if (userResp.ok) {
+    try {
+      const json = (await userResp.json()) as { success?: boolean; result?: unknown }
+      if (json.success && json.result) {
+        const parsed = UserSchema.safeParse(json.result)
+        if (parsed.success) {
+          user = parsed.data
+        } else {
+          console.error('Cloudflare API /user payload did not match expected shape', parsed.error)
+        }
+      }
+    } catch (error) {
+      console.error('Cloudflare API /user response is not valid JSON', error)
     }
+  }
+
+  // Parse accounts from response
+  let accounts: AccountSchema[] = []
+  if (accountsResp.ok) {
+    try {
+      const json = (await accountsResp.json()) as { success?: boolean; result?: unknown }
+      if (json.success && json.result) {
+        const parsed = AccountsSchema.safeParse(json.result)
+        if (parsed.success) {
+          accounts = parsed.data
+        } else {
+          console.error(
+            'Cloudflare API /accounts payload did not match expected shape',
+            parsed.error
+          )
+        }
+      }
+    } catch (error) {
+      console.error('Cloudflare API /accounts response is not valid JSON', error)
+    }
+  }
+
+  if (user) {
+    return { user, accounts }
   }
 
   // Account-scoped token - user will be null
@@ -350,6 +387,8 @@ export function createAuthHandlers() {
       // Fetch user and accounts
       const { user, accounts } = await getUserAndAccounts(access_token)
 
+      // Account-scoped tokens (user: null) are only supported via API token mode
+      // (see api-token-mode.ts). The OAuth flow always requires a user identity.
       if (!user) {
         return new OAuthError(
           'server_error',
